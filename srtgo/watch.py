@@ -33,11 +33,15 @@ from .ktx import (
     NeedToLoginError,
     NetFunnelError,
     NoResultsError,
+    ReserveOption,
+    SoldOutError,
     TrainType,
     AdultPassenger,
+    ChildPassenger,
+    SeniorPassenger,
 )
-from .srt import SRT, SRTError, SRTNetFunnelError, Adult
-from .srtgo import STATIONS, get_telegram
+from .srt import SRT, SRTError, SRTNetFunnelError, SeatType, Adult, Child, Senior
+from .srtgo import STATIONS, get_telegram, pay_card
 
 try:
     from zoneinfo import ZoneInfo
@@ -55,6 +59,23 @@ MIN_INTERVAL = 10
 
 # 수도권 KTX 역 -> SRT 대체역 (SRT 는 수서에서 출발한다)
 SEOUL_TO_SUSEO = {"서울", "용산", "영등포", "광명", "청량리", "행신"}
+
+# --seat-type -> 각 철도사의 예약 옵션
+SEAT_OPTION = {
+    "SRT": {
+        "any": SeatType.GENERAL_FIRST,
+        "general": SeatType.GENERAL_ONLY,
+        "special": SeatType.SPECIAL_ONLY,
+    },
+    "KTX": {
+        "any": ReserveOption.GENERAL_FIRST,
+        "general": ReserveOption.GENERAL_ONLY,
+        "special": ReserveOption.SPECIAL_ONLY,
+    },
+}
+
+# 예매 성공 후 결제까지 끝나면 이 코드로 종료한다
+EXIT_RESERVED = 0
 
 
 def _keyring_get(service: str, key: str) -> Optional[str]:
@@ -160,7 +181,7 @@ class RailWatcher:
         arr: str,
         start: datetime,
         end: datetime,
-        passengers: int,
+        passengers: Dict[str, int],
         seat_type: str,
         include_standby: bool,
         ktx_only: bool,
@@ -172,13 +193,30 @@ class RailWatcher:
         self.arr = arr
         self.start = start
         self.end = end
-        self.passengers = passengers
+        self.counts = passengers
+        self.total_passengers = sum(passengers.values())
         self.seat_type = seat_type
+        self.seat_option = SEAT_OPTION[rail_type][seat_type]
         self.include_standby = include_standby
         self.ktx_only = ktx_only
         self.debug = debug
         self.rail = None
         self.state: Dict[Tuple[str, str, str, str], bool] = {}
+        # 이번 스윕에서 예매 가능한 열차 (예매 모드에서 사용)
+        self.open_trains: List[object] = []
+
+    def passenger_objects(self) -> List:
+        """예약 요청에 쓸 실제 승객 객체 목록."""
+        classes = (
+            {"adult": Adult, "child": Child, "senior": Senior}
+            if self.is_srt
+            else {
+                "adult": AdultPassenger,
+                "child": ChildPassenger,
+                "senior": SeniorPassenger,
+            }
+        )
+        return [classes[k](n) for k, n in self.counts.items() if n > 0]
 
     # --- 로그인 -------------------------------------------------------
     def _credentials(self) -> Tuple[str, str]:
@@ -215,7 +253,7 @@ class RailWatcher:
                 arr=self.arr,
                 date=date,
                 time=dep_time,
-                passengers=[Adult(self.passengers)],
+                passengers=[Adult(self.total_passengers)],
                 available_only=False,
             )
         params = {
@@ -223,7 +261,7 @@ class RailWatcher:
             "arr": self.arr,
             "date": date,
             "time": dep_time,
-            "passengers": [AdultPassenger(self.passengers)],
+            "passengers": [AdultPassenger(self.total_passengers)],
             "include_no_seats": True,
             "include_waiting_list": True,
         }
@@ -287,6 +325,7 @@ class RailWatcher:
         """(새로 열린 열차, 지금 예매 가능한 열차, 전체 현황) 메시지를 돌려준다."""
         trains = self.sweep()
         newly, open_now, snapshot = [], [], []
+        self.open_trains = []
         for train in trains:
             key = _train_key(self.rail_type, train, self.is_srt)
             ok = _available(train, self.seat_type, self.include_standby, self.is_srt)
@@ -294,6 +333,7 @@ class RailWatcher:
             snapshot.append(line)
             if ok:
                 open_now.append(line)
+                self.open_trains.append(train)
                 if not self.state.get(key, False):
                     newly.append(line)
             self.state[key] = ok
@@ -325,6 +365,78 @@ class RailWatcher:
             self.rail.clear()
             return
         self.login()
+
+
+def _try_reserve(candidates, pay: bool, dry_run: bool) -> Optional[str]:
+    """예매 가능한 열차를 순서대로 시도한다. 성공하면 결과 메시지를 돌려준다.
+
+    결제는 srtgo 가 이미 제공하는 pay_card() 를 그대로 쓴다 (--pay 를 준 경우에만).
+    """
+    for watcher, train in candidates:
+        label = f"[{watcher.rail_type}] {train}"
+        if dry_run:
+            _log(colored(f"[DRY-RUN] 예매를 시도했을 열차: {label}", "cyan"))
+            return None
+        _log(f"예매 시도: {label}")
+        try:
+            reservation = watcher.rail.reserve(
+                train,
+                passengers=watcher.passenger_objects(),
+                option=watcher.seat_option,
+            )
+        except (SoldOutError, KorailError, SRTError) as ex:
+            msg = getattr(ex, "msg", str(ex)) or type(ex).__name__
+            # 한발 늦었거나 조건이 안 맞는 경우 - 다음 후보로 넘어간다
+            _log(colored(f"  실패 ({msg}), 다음 후보 시도", "yellow"))
+            continue
+
+        text = f"{reservation}"
+        if getattr(reservation, "tickets", None):
+            text += "\n" + "\n".join(map(str, reservation.tickets))
+
+        if reservation.is_waiting:
+            return "🎫 예약대기 신청 완료\n" + text
+
+        text = "🎫 예매 성공!\n" + text
+        if pay:
+            try:
+                paid = pay_card(watcher.rail, reservation)
+            except Exception as err:
+                paid, text = False, text + f"\n⚠️ 결제 중 오류: {err}"
+            text += (
+                "\n💳 결제 완료"
+                if paid
+                else "\n⚠️ 자동 결제가 되지 않았습니다. 구입기한 내에 직접 결제하세요."
+            )
+        else:
+            text += "\n⚠️ 아직 미결제 상태입니다. 구입기한 내에 직접 결제하세요."
+        return text
+    return None
+
+
+def _confirm_reserve(watchers, start_dt, end_dt, pay: bool, assume_yes: bool) -> None:
+    """실제 예약이 일어나므로 시작 전에 조건을 보여주고 확인받는다."""
+    passengers = ", ".join(f"{k} {v}명" for k, v in watchers[0].counts.items() if v)
+    print(
+        colored(
+            "\n⚠️  자동 예매 모드: 조건에 맞는 자리를 발견하면 즉시 예약합니다.", "yellow"
+        )
+    )
+    print(
+        f"  구간   : {' + '.join(f'{w.rail_type} {w.dep}→{w.arr}' for w in watchers)}\n"
+        f"  시간대 : {start_dt:%Y-%m-%d %H:%M} ~ {end_dt:%Y-%m-%d %H:%M} 출발\n"
+        f"  승객   : {passengers}\n"
+        f"  좌석   : {watchers[0].seat_type}\n"
+        f"  결제   : {'등록된 카드로 자동 결제' if pay else '예약만 (결제는 직접)'}\n"
+    )
+    if assume_yes:
+        return
+    if not sys.stdin.isatty():
+        raise click.ClickException(
+            "자동 예매는 확인이 필요합니다. 터미널이 아닌 환경에서는 --yes 를 명시하세요."
+        )
+    if not click.confirm("위 조건으로 자동 예매를 시작할까요?", default=False):
+        raise click.Abort()
 
 
 def _telegram_sender():
@@ -388,6 +500,8 @@ def _resolve_stations(rail_type: str, dep: str, arr: str) -> Tuple[str, str]:
 @click.option("--start", required=True, help='감시 시작 시각 (예: "2026-09-23 12:00")')
 @click.option("--end", required=True, help='감시 종료 시각 (예: "2026-09-24 12:00")')
 @click.option("--passengers", default=1, show_default=True, help="성인 승객 수")
+@click.option("--child", default=0, show_default=True, help="어린이 승객 수")
+@click.option("--senior", default=0, show_default=True, help="경로 승객 수")
 @click.option(
     "--seat-type",
     type=click.Choice(["any", "general", "special"]),
@@ -407,6 +521,30 @@ def _resolve_stations(rail_type: str, dep: str, arr: str) -> Tuple[str, str]:
     show_default=True,
     help="자리가 계속 있을 때 N분마다 다시 알림 (0=상태가 바뀔 때만)",
 )
+@click.option(
+    "--reserve",
+    "do_reserve",
+    is_flag=True,
+    help="감시만 하지 않고, 자리가 나면 즉시 예약까지 진행합니다.",
+)
+@click.option(
+    "--pay",
+    is_flag=True,
+    help="예약 성공 시 srtgo 에 등록된 카드로 결제까지 진행 (--reserve 필요)",
+)
+@click.option(
+    "--prefer",
+    type=click.Choice(["earliest", "latest"]),
+    default="earliest",
+    show_default=True,
+    help="여러 편이 동시에 열렸을 때 어느 쪽을 먼저 잡을지",
+)
+@click.option("--yes", "assume_yes", is_flag=True, help="자동 예매 확인 프롬프트 생략")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="예약 직전까지만 수행하고 실제 예약은 하지 않습니다 (--reserve 검증용)",
+)
 @click.option("--debug", is_flag=True, help="디버그 출력")
 def watch(
     rails,
@@ -417,6 +555,8 @@ def watch(
     start,
     end,
     passengers,
+    child,
+    senior,
     seat_type,
     include_standby,
     ktx_only,
@@ -425,14 +565,30 @@ def watch(
     telegram,
     exec_cmd,
     repeat_notify,
+    do_reserve,
+    pay,
+    prefer,
+    assume_yes,
+    dry_run,
     debug,
 ):
-    """지정한 구간·시간대의 좌석이 열리는지 주기적으로 감시합니다 (예매는 하지 않음)."""
+    """지정한 구간·시간대의 좌석을 감시하고, --reserve 를 주면 예약까지 진행합니다."""
     rails = tuple(dict.fromkeys(r.upper() for r in rails))
     interval = max(interval, MIN_INTERVAL)
     start_dt, end_dt = parse_when(start), parse_when(end, end=True)
     if end_dt <= start_dt:
         raise click.ClickException("--end 는 --start 보다 뒤여야 합니다.")
+
+    counts = {"adult": passengers, "child": child, "senior": senior}
+    total = sum(counts.values())
+    if total < 1:
+        raise click.ClickException("승객수는 1명 이상이어야 합니다.")
+    if total > 9:
+        raise click.ClickException("승객수는 9명을 초과할 수 없습니다.")
+    if pay and not do_reserve:
+        raise click.ClickException("--pay 는 --reserve 와 함께 써야 합니다.")
+    if dry_run and not do_reserve:
+        raise click.ClickException("--dry-run 은 --reserve 와 함께 써야 합니다.")
 
     watchers = []
     for rail_type in rails:
@@ -446,7 +602,7 @@ def watch(
                 r_arr,
                 start_dt,
                 end_dt,
-                passengers,
+                counts,
                 seat_type,
                 include_standby,
                 ktx_only,
@@ -454,11 +610,16 @@ def watch(
             )
         )
 
+    if do_reserve:
+        _confirm_reserve(watchers, start_dt, end_dt, pay, assume_yes)
+
+    mode = "자동 예매" + (" (DRY-RUN)" if dry_run else "") if do_reserve else "감시"
     _log(
         colored(
-            f"감시 시작: {' + '.join(f'{w.rail_type} {w.dep}→{w.arr}' for w in watchers)} | "
+            f"{mode} 시작: "
+            f"{' + '.join(f'{w.rail_type} {w.dep}→{w.arr}' for w in watchers)} | "
             f"{start_dt:%m/%d %H:%M} ~ {end_dt:%m/%d %H:%M} | "
-            f"{passengers}명 | {interval}초 간격",
+            f"{total}명 | {interval}초 간격",
             "cyan",
         )
     )
@@ -497,6 +658,25 @@ def watch(
 
             n_open, n_total = len(open_now), len(snapshot)
 
+            # 예매 모드: 열려 있는 자리를 선호 순서대로 잡는다
+            if do_reserve and n_open:
+                candidates = [
+                    (w, t) for w in watchers for t in w.open_trains
+                ]
+                candidates.sort(
+                    key=lambda wt: (wt[1].dep_date, wt[1].dep_time),
+                    reverse=(prefer == "latest"),
+                )
+                try:
+                    result = _try_reserve(candidates, pay, dry_run)
+                except Exception as ex:
+                    _log(colored(f"예매 중 오류 ({type(ex).__name__}: {ex})", "red"))
+                    result = None
+                if result:
+                    _log(colored(result, "white", "on_green"))
+                    _notify(result, tg_sender, exec_cmd)
+                    return EXIT_RESERVED
+
             if newly:
                 text = "🚄 좌석이 열렸습니다!\n" + "\n".join(newly)
                 _log(colored(text, "white", "on_green"))
@@ -525,8 +705,9 @@ def watch(
                 break
             time.sleep(gammavariate(4, interval / 8) + interval * 0.5)
     except KeyboardInterrupt:
-        _log("감시를 종료합니다.")
+        _log("종료합니다.")
         return 0
+    return 0
 
 
 if __name__ == "__main__":
