@@ -56,6 +56,8 @@ MAX_PAGES_PER_DAY = 12
 PAGE_INTERVAL = (0.7, 1.6)
 # --interval 로 줄 수 있는 최소값. 서버에 부담을 주지 않기 위한 하한선.
 MIN_INTERVAL = 10
+# SRT 가 '조회 결과 없음' 을 에러로 돌려줄 때 쓰는 문구들 (정상 상황으로 처리한다)
+SRT_EMPTY_MARKERS = ("직통열차", "조회 결과가 없", "열차가 없")
 
 # 수도권 KTX 역 -> SRT 대체역 (SRT 는 수서에서 출발한다)
 SEOUL_TO_SUSEO = {"서울", "용산", "영등포", "광명", "청량리", "행신"}
@@ -248,14 +250,20 @@ class RailWatcher:
     # --- 조회 ---------------------------------------------------------
     def _search_page(self, date: str, dep_time: str) -> List:
         if self.is_srt:
-            return self.rail.search_train(
-                dep=self.dep,
-                arr=self.arr,
-                date=date,
-                time=dep_time,
-                passengers=[Adult(self.total_passengers)],
-                available_only=False,
-            )
+            try:
+                return self.rail.search_train(
+                    dep=self.dep,
+                    arr=self.arr,
+                    date=date,
+                    time=dep_time,
+                    passengers=[Adult(self.total_passengers)],
+                    available_only=False,
+                )
+            except SRTError as ex:
+                msg = getattr(ex, "msg", "") or ""
+                if any(marker in msg for marker in SRT_EMPTY_MARKERS):
+                    return []
+                raise
         params = {
             "dep": self.dep,
             "arr": self.arr,

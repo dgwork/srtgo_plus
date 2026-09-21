@@ -78,6 +78,7 @@ TRAIN_NAME = {
     "07": "KTX-산천",
     "08": "ITX-새마을",
     "09": "ITX-청춘",
+    "0A": "KTX-산천",
     "10": "KTX-산천",
     "17": "SRT",
     "18": "ITX-마음",
@@ -309,7 +310,7 @@ class SRTReservation:
         self.seat_count = train.get("tkSpecNum") or int(train.get("seatNum"))
 
         self.train_code = pay.get("stlbTrnClsfCd")
-        self.train_name = TRAIN_NAME[self.train_code]
+        self.train_name = TRAIN_NAME.get(self.train_code, self.train_code)
         self.train_number = pay.get("trnNo")
 
         self.dep_date = pay.get("dptDt")
@@ -425,7 +426,7 @@ class Train:
 class SRTTrain(Train):
     def __init__(self, data):
         self.train_code = data["stlbTrnClsfCd"]
-        self.train_name = TRAIN_NAME[self.train_code]
+        self.train_name = TRAIN_NAME.get(self.train_code, self.train_code)
         self.train_number = data["trnNo"]
 
         # Departure info
@@ -831,7 +832,6 @@ class SRT:
             for train in (
                 SRTTrain(t)
                 for t in parser.get_all()["outDataSets"]["dsOutput1"]
-                if t["stlbTrnClsfCd"] == "17"
             )
             if (not available_only or train.seat_available())
             and (not time_limit or train.dep_time <= time_limit)
