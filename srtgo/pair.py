@@ -332,8 +332,12 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
             )
 
             # 4) 예약 시도
+            # 이미 확보한 '바닥' 좌석은 상한에서 뺀다. 그러지 않으면 서울에서
+            # 인원수를 채운 순간 상한이 차버려서 2단계에서 수서 표를 못 산다.
+            floor_seats = holdings.seats_on(floor) if floor else 0
             for need, dep_name, train, key in candidates:
-                if max_holds and holdings.total() >= max_holds and holdings.seats_on(key) == 0:
+                in_play = holdings.total() - floor_seats
+                if max_holds and in_play >= max_holds and holdings.seats_on(key) == 0:
                     continue  # 상한에 걸렸으면 새 열차로 벌리지 않는다 (짝 맞추기는 계속)
                 if dry_run:
                     _log(colored(f"[DRY-RUN] 예약 시도했을 열차: [{dep_name}] {train} (필요 {need}석)", "cyan"))
