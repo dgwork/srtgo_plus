@@ -78,6 +78,8 @@ class Holdings:
         self.end = end
         self.by_train: Dict[TrainKey, int] = {}
         self.detail: Dict[TrainKey, List] = {}
+        # 서버 목록 반영이 늦을 때 쓰는 출발역 보조 정보
+        self.dep_hint: Dict[TrainKey, str] = {}
 
     def _all_holdings(self) -> List:
         """미결제 예약 + 결제 완료된 승차권을 함께 읽는다.
@@ -85,10 +87,13 @@ class Holdings:
         결제하는 순간 그 건은 reservations() 에서 빠지고 tickets() 로 넘어간다.
         예약만 보면 방금 결제한 표를 '없는 것' 으로 판단해 같은 자리를 또 사게 된다.
         """
-        items, ok = [], 0
-        for fetch in (self.rail.reservations, self.rail.tickets):
+        reservations, tickets, ok = [], [], 0
+        for fetch, bucket in (
+            (self.rail.reservations, reservations),
+            (self.rail.tickets, tickets),
+        ):
             try:
-                items += list(fetch() or [])
+                bucket += list(fetch() or [])
                 ok += 1
             except Exception:
                 continue  # 한쪽이 실패해도 나머지는 살린다
@@ -96,15 +101,20 @@ class Holdings:
             # 둘 다 실패했는데 '보유 0' 으로 넘어가면 같은 자리를 또 산다.
             # 이전 상태를 유지하도록 호출부로 올린다.
             raise RuntimeError("보유 내역 조회에 실패했습니다")
-        return items
+
+        # tickets() 는 좌석 하나당 행 하나를 준다. 즉 2석짜리 구매는 같은 예약번호로
+        # 행이 두 개다. 여기서 예약번호로 중복을 거르면 2석을 1석으로 세어
+        # '아직 목표 미달' 로 오판하고 같은 구간을 계속 사게 된다.
+        # 따라서 행은 합치되, 결제 전후로 같은 건이 양쪽에 걸쳐 보이는 경우에만
+        # 결제본(tickets) 쪽을 채택한다.
+        paid_pnrs = {getattr(t, "pnr_no", None) for t in tickets}
+        rows = list(tickets)
+        rows += [r for r in reservations if getattr(r, "rsv_id", None) not in paid_pnrs]
+        return rows
 
     def refresh(self) -> None:
-        by_train, detail, seen = {}, {}, set()
+        by_train, detail = {}, {}
         for rsv in self._all_holdings():
-            # 같은 건이 양쪽 목록에 다 보일 수 있으므로 예약번호로 중복을 거른다
-            pnr = getattr(rsv, "rsv_id", None) or getattr(rsv, "pnr_no", None)
-            if pnr and pnr in seen:
-                continue
             if rsv.arr_name != self.arr or rsv.dep_name not in self.deps:
                 continue
             if getattr(rsv, "is_waiting", False):
@@ -115,8 +125,6 @@ class Holdings:
                 continue
             if not (self.start <= when <= self.end):
                 continue
-            if pnr:
-                seen.add(pnr)
             key = _rsv_key(rsv)
             by_train[key] = by_train.get(key, 0) + int(rsv.seat_no_count)
             detail.setdefault(key, []).append(rsv)
@@ -156,7 +164,9 @@ def _settle(rail, rsv) -> str:
 
 def _dep_of(key: TrainKey, holdings: Holdings) -> Optional[str]:
     rsvs = holdings.detail.get(key)
-    return rsvs[0].dep_name if rsvs else None
+    if rsvs:
+        return rsvs[0].dep_name
+    return holdings.dep_hint.get(key)
 
 
 @click.command()
@@ -241,6 +251,41 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
     def notify(text: str) -> None:
         _notify(text, tg, None)
 
+    def evaluate() -> bool:
+        """목표 달성 여부를 판정한다. 최종 달성이면 True.
+
+        예약을 한 건 할 때마다 즉시 불러야 한다. 회차 시작 시점에만 검사하면
+        이미 목표를 채운 뒤에도 같은 회차의 남은 후보를 계속 사들인다.
+        """
+        nonlocal floor, active
+        for key in holdings.complete_trains(seats):
+            dep_name = _dep_of(key, holdings)
+            if prefer_dep is None or dep_name == prefer_dep:
+                text = (
+                    f"🎉 {dep_name} 출발 열차 {key[0]} 에 {seats}석 확보 완료! 탐색을 종료합니다.\n"
+                    + holdings.describe()
+                    + (
+                        "\n\n결제까지 끝난 표입니다. 짝이 맞지 않고 남은 표는 "
+                        "직접 확인해서 정리하세요."
+                        if pay
+                        else "\n\n⚠️ 미결제 상태입니다. 구입기한 내 결제하세요."
+                    )
+                )
+                _log(colored(text, "white", "on_green"))
+                notify(text)
+                return True
+            if floor != key:
+                floor = key
+                active = [prefer_dep]
+                text = (
+                    f"✅ 바닥 확보: {dep_name} 출발 {key[0]} 에 {seats}석.\n"
+                    f"이제 {prefer_dep} 출발 열차만 노립니다. 기존 표는 그대로 둡니다.\n"
+                    + holdings.describe()
+                )
+                _log(colored(text, "white", "on_blue"))
+                notify(text)
+        return False
+
     try:
         while True:
             sweep_no += 1
@@ -251,33 +296,9 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
             except Exception as ex:
                 _log(colored(f"보유 예약 조회 실패 ({type(ex).__name__}), 다음 회차에 다시 시도", "yellow"))
 
-            # 2) 승리 조건 확인
-            for key in holdings.complete_trains(seats):
-                dep_name = _dep_of(key, holdings)
-                if prefer_dep is None or dep_name == prefer_dep:
-                    text = (
-                        f"🎉 {dep_name} 출발 열차 {key[0]} 에 {seats}석 확보 완료!\n"
-                        + holdings.describe()
-                        + (
-                            "\n\n결제까지 끝난 표입니다. 짝이 맞지 않고 남은 1장짜리 예약은 "
-                            "직접 확인해서 정리하세요."
-                            if pay
-                            else "\n\n⚠️ 미결제 상태입니다. 구입기한 내 결제하세요."
-                        )
-                    )
-                    _log(colored(text, "white", "on_green"))
-                    notify(text)
-                    return 0
-                if floor != key:
-                    floor = key
-                    active = [prefer_dep]
-                    text = (
-                        f"✅ 바닥 확보: {dep_name} 출발 {key[0]} 에 {seats}석.\n"
-                        f"이제 {prefer_dep} 출발 열차만 노립니다. 기존 표는 그대로 둡니다.\n"
-                        + holdings.describe()
-                    )
-                    _log(colored(text, "white", "on_blue"))
-                    notify(text)
+            # 2) 승리 조건 확인 - 이미 채웠으면 아무것도 사지 않고 끝낸다
+            if evaluate():
+                return 0
 
             # 3) 후보 수집 - 지금 예약 가능한 열차
             candidates = []
@@ -318,6 +339,8 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
                     _log(colored(f"[DRY-RUN] 예약 시도했을 열차: [{dep_name}] {train} (필요 {need}석)", "cyan"))
                     continue
 
+                prev = holdings.seats_on(key)
+                bought = 0
                 # 한 번에 need 석을 잡을 수 있으면 그게 최선, 안 되면 1석이라도
                 for count in ([need, 1] if need > 1 else [1]):
                     try:
@@ -343,12 +366,28 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
                     )
                     _log(colored(text, "white", "on_green"))
                     notify(text)
-                    try:
-                        holdings.refresh()
-                    except Exception:
-                        # 다음 회차에 다시 읽는다. 최소한 방금 산 만큼은 반영해 둔다.
-                        holdings.by_train[key] = holdings.seats_on(key) + count
+                    bought = count
                     break
+
+                if not bought:
+                    continue
+
+                # 방금 산 좌석은 무슨 일이 있어도 집계에 반영한다.
+                # 서버 목록 반영이 늦거나 조회가 실패했을 때 '아직 미달' 로 오판하면
+                # 같은 구간을 계속 사들이게 된다.
+                try:
+                    holdings.refresh()
+                except Exception:
+                    pass
+                holdings.dep_hint[key] = dep_name
+                if holdings.seats_on(key) < prev + bought:
+                    holdings.by_train[key] = prev + bought
+
+                # 한 건 살 때마다 즉시 판정한다
+                if evaluate():
+                    return 0
+                if dep_name not in active:
+                    break  # 단계가 바뀌었으므로 이번 회차 후보 목록은 버린다
 
             # 5) 현황 한 줄
             held_desc = ", ".join(
