@@ -33,3 +33,4 @@ Homepage = "https://github.com/lapis42/srtgo"
 
 [project.scripts]
 srtgo = "srtgo.srtgo:srtgo"
+srtgo-watch = "srtgo.watch:watch"
