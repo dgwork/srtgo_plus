@@ -188,6 +188,7 @@ class RailWatcher:
         include_standby: bool,
         ktx_only: bool,
         debug: bool,
+        sessions: Dict[str, object],
     ):
         self.rail_type = rail_type
         self.is_srt = rail_type == "SRT"
@@ -202,7 +203,8 @@ class RailWatcher:
         self.include_standby = include_standby
         self.ktx_only = ktx_only
         self.debug = debug
-        self.rail = None
+        # 같은 철도사를 보는 감시자끼리 세션을 공유한다 (계정당 로그인 1회)
+        self._sessions = sessions
         self.state: Dict[Tuple[str, str, str, str], bool] = {}
         # 이번 스윕에서 예매 가능한 열차 (예매 모드에서 사용)
         self.open_trains: List[object] = []
@@ -237,15 +239,28 @@ class RailWatcher:
             )
         return user_id, password
 
-    def login(self) -> None:
+    @property
+    def rail(self):
+        return self._sessions.get(self.rail_type)
+
+    @staticmethod
+    def _logged_in(rail) -> bool:
+        if rail is None:
+            return False
+        state = getattr(rail, "is_login", None)
+        if state is None:
+            state = getattr(rail, "logined", False)
+        return bool(state)
+
+    def login(self, force: bool = False) -> None:
+        if not force and self._logged_in(self.rail):
+            return
         user_id, password = self._credentials()
         cls = SRT if self.is_srt else Korail
-        self.rail = cls(user_id, password, verbose=self.debug)
-        logged_in = getattr(self.rail, "is_login", None)
-        if logged_in is None:
-            logged_in = getattr(self.rail, "logined", False)
-        if not logged_in:
+        rail = cls(user_id, password, verbose=self.debug)
+        if not self._logged_in(rail):
             raise click.ClickException(f"{self.rail_type} 로그인에 실패했습니다.")
+        self._sessions[self.rail_type] = rail
 
     # --- 조회 ---------------------------------------------------------
     def _search_page(self, date: str, dep_time: str) -> List:
@@ -358,10 +373,10 @@ class RailWatcher:
             self.rail.clear()
             return
         if isinstance(ex, NeedToLoginError) or "Need to Login" in msg or "로그인 후 사용" in msg:
-            self.login()
+            self.login(force=True)
             return
         if isinstance(ex, (ConnectionError, JSONDecodeError)):
-            self.login()
+            self.login(force=True)
             return
         if isinstance(ex, (KorailError, SRTError)):
             # 잔여석 없음류는 정상 상태이므로 조용히 넘어간다
@@ -372,7 +387,7 @@ class RailWatcher:
                 return
             self.rail.clear()
             return
-        self.login()
+        self.login(force=True)
 
 
 def _try_reserve(candidates, pay: bool, dry_run: bool) -> Optional[str]:
@@ -501,7 +516,13 @@ def _resolve_stations(rail_type: str, dep: str, arr: str) -> Tuple[str, str]:
     default=("KTX",),
     help="감시할 철도사. 여러 번 줄 수 있습니다 (예: --rail KTX --rail SRT).",
 )
-@click.option("--dep", required=True, help="출발역 (예: 서울)")
+@click.option(
+    "--dep",
+    "deps",
+    multiple=True,
+    required=True,
+    help="출발역. 여러 번 줄 수 있습니다 (예: --dep 서울 --dep 수서).",
+)
 @click.option("--arr", required=True, help="도착역 (예: 포항)")
 @click.option("--srt-dep", default=None, help="SRT 출발역을 따로 지정 (기본: --dep, 수도권이면 수서)")
 @click.option("--srt-arr", default=None, help="SRT 도착역을 따로 지정 (기본: --arr)")
@@ -556,7 +577,7 @@ def _resolve_stations(rail_type: str, dep: str, arr: str) -> Tuple[str, str]:
 @click.option("--debug", is_flag=True, help="디버그 출력")
 def watch(
     rails,
-    dep,
+    deps,
     arr,
     srt_dep,
     srt_arr,
@@ -599,24 +620,32 @@ def watch(
         raise click.ClickException("--dry-run 은 --reserve 와 함께 써야 합니다.")
 
     watchers = []
+    sessions: Dict[str, object] = {}
+    seen = set()
     for rail_type in rails:
-        r_dep = (srt_dep or dep) if rail_type == "SRT" else dep
+        rail_deps = (srt_dep,) if (rail_type == "SRT" and srt_dep) else deps
         r_arr = (srt_arr or arr) if rail_type == "SRT" else arr
-        r_dep, r_arr = _resolve_stations(rail_type, r_dep, r_arr)
-        watchers.append(
-            RailWatcher(
-                rail_type,
-                r_dep,
-                r_arr,
-                start_dt,
-                end_dt,
-                counts,
-                seat_type,
-                include_standby,
-                ktx_only,
-                debug,
+        for raw_dep in rail_deps:
+            r_dep, resolved_arr = _resolve_stations(rail_type, raw_dep, r_arr)
+            # 수도권 역을 여러 개 준 경우 SRT 쪽은 전부 수서로 모이므로 중복을 걸러낸다
+            if (rail_type, r_dep, resolved_arr) in seen:
+                continue
+            seen.add((rail_type, r_dep, resolved_arr))
+            watchers.append(
+                RailWatcher(
+                    rail_type,
+                    r_dep,
+                    resolved_arr,
+                    start_dt,
+                    end_dt,
+                    counts,
+                    seat_type,
+                    include_standby,
+                    ktx_only,
+                    debug,
+                    sessions,
+                )
             )
-        )
 
     if do_reserve:
         _confirm_reserve(watchers, start_dt, end_dt, pay, assume_yes)
