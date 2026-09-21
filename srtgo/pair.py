@@ -1,0 +1,370 @@
+"""일행 인원수만큼 '같은 열차' 좌석을 모으는 실행기.
+
+명절처럼 2석이 한 번에 나오지 않는 상황을 위한 전략이다.
+조건 구간의 열차를 계속 훑으면서 **1석이라도 보이면 일단 예약**해 두고,
+그러다 특정 열차에 예약이 인원수만큼 겹치는 순간을 승리로 본다.
+
+    # 서울/수서 아무거나 -> 2장이 한 열차에 겹치면 성공, 단 수서를 최종 목표로
+    srtgo-pair --dep 서울 --dep 수서 --prefer-dep 수서 --arr 포항 \
+        --start "2026-09-23 17:00" --end "2026-09-24 10:00"
+
+--prefer-dep 을 주면 2단계로 동작한다.
+  1단계: 모든 출발역 대상. 어느 열차든 인원수를 채우면 '바닥'을 확보한 것.
+  2단계: 확보한 열차가 --prefer-dep 이 아니면, 이제 --prefer-dep 출발
+         열차만 대상으로 같은 일을 반복한다. 이미 잡은 표는 놓지 않는다.
+
+통합(2026-09-01 운행분~) 이후 수서 출발 편성도 코레일이 판매하므로
+이 명령은 코레일 계정 하나만 쓴다.
+"""
+
+from datetime import datetime, timedelta
+from random import gammavariate
+from termcolor import colored
+from typing import Dict, List, Optional, Tuple
+
+import click
+import sys
+import time
+
+from .ktx import AdultPassenger, KorailError, ReserveOption
+from .srtgo import pay_card
+from .watch import (
+    MIN_INTERVAL,
+    RailWatcher,
+    _log,
+    _notify,
+    _resolve_stations,
+    _telegram_sender,
+    parse_when,
+)
+
+# 좌석 유형 -> 예약 옵션
+SEAT_OPTION = {
+    "any": ReserveOption.GENERAL_FIRST,
+    "general": ReserveOption.GENERAL_ONLY,
+    "special": ReserveOption.SPECIAL_ONLY,
+}
+
+TrainKey = Tuple[str, str]
+
+
+def _train_key(train) -> TrainKey:
+    return (str(train.train_no), str(train.dep_date))
+
+
+def _rsv_key(rsv) -> TrainKey:
+    return (str(rsv.train_no), str(rsv.dep_date))
+
+
+def _dep_dt(date: str, dep_time: str) -> datetime:
+    return datetime(
+        int(date[0:4]), int(date[4:6]), int(date[6:8]),
+        int(dep_time[0:2]), int(dep_time[2:4]),
+    )
+
+
+class Holdings:
+    """지금 내가 들고 있는 예약 현황. 서버 응답을 그대로 신뢰한다.
+
+    스크립트가 재시작되거나 예약이 구입기한을 넘겨 사라져도, 매 스윕마다
+    서버에서 다시 읽으므로 상태가 어긋나지 않는다.
+    """
+
+    def __init__(self, rail, arr: str, deps: Tuple[str, ...], start: datetime, end: datetime):
+        self.rail = rail
+        self.arr = arr
+        self.deps = set(deps)
+        self.start = start
+        self.end = end
+        self.by_train: Dict[TrainKey, int] = {}
+        self.detail: Dict[TrainKey, List] = {}
+
+    def _all_holdings(self) -> List:
+        """미결제 예약 + 결제 완료된 승차권을 함께 읽는다.
+
+        결제하는 순간 그 건은 reservations() 에서 빠지고 tickets() 로 넘어간다.
+        예약만 보면 방금 결제한 표를 '없는 것' 으로 판단해 같은 자리를 또 사게 된다.
+        """
+        items, ok = [], 0
+        for fetch in (self.rail.reservations, self.rail.tickets):
+            try:
+                items += list(fetch() or [])
+                ok += 1
+            except Exception:
+                continue  # 한쪽이 실패해도 나머지는 살린다
+        if not ok:
+            # 둘 다 실패했는데 '보유 0' 으로 넘어가면 같은 자리를 또 산다.
+            # 이전 상태를 유지하도록 호출부로 올린다.
+            raise RuntimeError("보유 내역 조회에 실패했습니다")
+        return items
+
+    def refresh(self) -> None:
+        by_train, detail, seen = {}, {}, set()
+        for rsv in self._all_holdings():
+            # 같은 건이 양쪽 목록에 다 보일 수 있으므로 예약번호로 중복을 거른다
+            pnr = getattr(rsv, "rsv_id", None) or getattr(rsv, "pnr_no", None)
+            if pnr and pnr in seen:
+                continue
+            if rsv.arr_name != self.arr or rsv.dep_name not in self.deps:
+                continue
+            if getattr(rsv, "is_waiting", False):
+                continue  # 예약대기는 확정 좌석이 아니다
+            try:
+                when = _dep_dt(rsv.dep_date, rsv.dep_time)
+            except (TypeError, ValueError):
+                continue
+            if not (self.start <= when <= self.end):
+                continue
+            if pnr:
+                seen.add(pnr)
+            key = _rsv_key(rsv)
+            by_train[key] = by_train.get(key, 0) + int(rsv.seat_no_count)
+            detail.setdefault(key, []).append(rsv)
+        # 조회가 통째로 실패한 경우가 아니라면 갱신한다
+        self.by_train, self.detail = by_train, detail
+
+    def seats_on(self, key: TrainKey) -> int:
+        return self.by_train.get(key, 0)
+
+    def total(self) -> int:
+        return sum(self.by_train.values())
+
+    def complete_trains(self, seats: int) -> List[TrainKey]:
+        return [k for k, n in self.by_train.items() if n >= seats]
+
+    def describe(self) -> str:
+        if not self.detail:
+            return "  (보유 없음)"
+        lines = []
+        for key in sorted(self.detail, key=lambda k: (k[1], k[0])):
+            for rsv in self.detail[key]:
+                lines.append(f"  {rsv}")
+        return "\n".join(lines)
+
+
+def _settle(rail, rsv) -> str:
+    """예약 직후 등록된 카드로 결제한다. 실패해도 예약은 남으므로 멈추지 않는다."""
+    if getattr(rsv, "is_waiting", False):
+        return "⚠️ 예약대기라 결제하지 않았습니다."
+    try:
+        if pay_card(rail, rsv):
+            return "💳 결제 완료"
+        return "⚠️ 결제 실패 - 카드 설정을 확인하고 구입기한 내 직접 결제하세요."
+    except Exception as err:
+        return f"⚠️ 결제 중 오류: {err} - 구입기한 내 직접 결제하세요."
+
+
+def _dep_of(key: TrainKey, holdings: Holdings) -> Optional[str]:
+    rsvs = holdings.detail.get(key)
+    return rsvs[0].dep_name if rsvs else None
+
+
+@click.command()
+@click.option("--dep", "deps", multiple=True, required=True,
+              help="출발역. 여러 번 줄 수 있습니다 (예: --dep 서울 --dep 수서).")
+@click.option("--arr", required=True, help="도착역 (예: 포항)")
+@click.option("--prefer-dep", default=None,
+              help="최종적으로 노릴 출발역. 여기서 인원수를 채우면 종료합니다.")
+@click.option("--start", required=True, help='시작 시각 (예: "2026-09-23 17:00")')
+@click.option("--end", required=True, help='종료 시각 (예: "2026-09-24 10:00")')
+@click.option("--seats", default=2, show_default=True, help="일행 인원수 (한 열차에 모아야 할 좌석 수)")
+@click.option("--max-holds", default=4, show_default=True,
+              help="동시에 들고 있을 1인 예약 총 수의 상한 (0=무제한)")
+@click.option("--seat-type", type=click.Choice(["any", "general", "special"]),
+              default="any", show_default=True)
+@click.option("--interval", default=30, show_default=True, help=f"조회 간격 (초, 최소 {MIN_INTERVAL})")
+@click.option("--pay/--no-pay", default=True, show_default=True,
+              help="예약 즉시 등록된 카드로 결제 (미결제 예약은 구입기한이 지나면 사라집니다)")
+@click.option("--telegram/--no-telegram", default=True, show_default=True,
+              help="예약·결제 내역을 텔레그램으로 전송")
+@click.option("--dry-run", is_flag=True, help="예약은 하지 않고 무엇을 시도할지만 출력")
+@click.option("--yes", "assume_yes", is_flag=True, help="시작 확인 프롬프트 생략")
+@click.option("--debug", is_flag=True, help="디버그 출력")
+def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
+         interval, pay, telegram, dry_run, assume_yes, debug):
+    """1석씩 모아서 한 열차에 --seats 장을 맞추는 예매기 (코레일 계정 전용)."""
+    interval = max(interval, MIN_INTERVAL)
+    start_dt, end_dt = parse_when(start), parse_when(end, end=True)
+    if end_dt <= start_dt:
+        raise click.ClickException("--end 는 --start 보다 뒤여야 합니다.")
+    if seats < 2:
+        raise click.ClickException("--seats 는 2 이상이어야 합니다. 1명이면 srtgo-watch 를 쓰세요.")
+
+    deps = tuple(dict.fromkeys(deps))
+    for d in deps:
+        _resolve_stations("KTX", d, arr)
+    if prefer_dep and prefer_dep not in deps:
+        raise click.ClickException(f"--prefer-dep {prefer_dep} 은 --dep 목록에 없습니다.")
+
+    print(colored("\n⚠️  이 명령은 자리가 보이는 대로 1인 예약을 반복 생성합니다.", "yellow"))
+    print(
+        f"  구간   : {'/'.join(deps)}→{arr}\n"
+        f"  시간대 : {start_dt:%Y-%m-%d %H:%M} ~ {end_dt:%Y-%m-%d %H:%M} 출발\n"
+        f"  목표   : 한 열차에 {seats}석"
+        + (f" (최종 목표 출발역: {prefer_dep})" if prefer_dep else "")
+        + f"\n  보유상한: {max_holds or '무제한'}\n"
+        + (
+            "  결제   : 예약 즉시 등록된 카드로 자동 결제\n"
+            "           (짝이 맞지 않은 표도 결제되며, 취소 시 환불 수수료가 붙습니다)\n"
+            if pay
+            else "  결제   : 하지 않음 (구입기한 내 직접 결제하세요)\n"
+        )
+        + ("  알림   : 텔레그램 전송\n" if telegram else "")
+    )
+    if not (dry_run or assume_yes):
+        if not sys.stdin.isatty():
+            raise click.ClickException("확인이 필요합니다. 비대화형 환경에서는 --yes 를 쓰세요.")
+        if not click.confirm("위 조건으로 시작할까요?", default=False):
+            raise click.Abort()
+
+    tg = _telegram_sender() if telegram else None
+    if telegram and tg is None:
+        _log(colored("텔레그램 설정이 없어 알림 없이 진행합니다.", "yellow"))
+
+    # 출발역마다 감시자를 하나씩 두고 세션은 공유한다 (로그인 1회)
+    sessions: Dict[str, object] = {}
+    watchers = {
+        d: RailWatcher("KTX", d, arr, start_dt, end_dt, {"adult": 1, "child": 0, "senior": 0},
+                       seat_type, False, False, debug, sessions)
+        for d in deps
+    }
+    for w in watchers.values():
+        w.login()
+    rail = next(iter(watchers.values())).rail
+
+    holdings = Holdings(rail, arr, deps, start_dt, end_dt)
+    option = SEAT_OPTION[seat_type]
+    active = list(deps)          # 지금 노리는 출발역들
+    floor: Optional[TrainKey] = None  # 이미 인원수를 채운 열차 (놓지 않는다)
+    sweep_no = 0
+
+    def notify(text: str) -> None:
+        _notify(text, tg, None)
+
+    try:
+        while True:
+            sweep_no += 1
+
+            # 1) 서버 기준으로 보유 현황을 다시 읽는다
+            try:
+                holdings.refresh()
+            except Exception as ex:
+                _log(colored(f"보유 예약 조회 실패 ({type(ex).__name__}), 다음 회차에 다시 시도", "yellow"))
+
+            # 2) 승리 조건 확인
+            for key in holdings.complete_trains(seats):
+                dep_name = _dep_of(key, holdings)
+                if prefer_dep is None or dep_name == prefer_dep:
+                    text = (
+                        f"🎉 {dep_name} 출발 열차 {key[0]} 에 {seats}석 확보 완료!\n"
+                        + holdings.describe()
+                        + (
+                            "\n\n결제까지 끝난 표입니다. 짝이 맞지 않고 남은 1장짜리 예약은 "
+                            "직접 확인해서 정리하세요."
+                            if pay
+                            else "\n\n⚠️ 미결제 상태입니다. 구입기한 내 결제하세요."
+                        )
+                    )
+                    _log(colored(text, "white", "on_green"))
+                    notify(text)
+                    return 0
+                if floor != key:
+                    floor = key
+                    active = [prefer_dep]
+                    text = (
+                        f"✅ 바닥 확보: {dep_name} 출발 {key[0]} 에 {seats}석.\n"
+                        f"이제 {prefer_dep} 출발 열차만 노립니다. 기존 표는 그대로 둡니다.\n"
+                        + holdings.describe()
+                    )
+                    _log(colored(text, "white", "on_blue"))
+                    notify(text)
+
+            # 3) 후보 수집 - 지금 예약 가능한 열차
+            candidates = []
+            for dep_name in active:
+                watcher = watchers[dep_name]
+                try:
+                    watcher.check()  # sweep + 가용 판정, open_trains 를 채운다
+                except Exception as ex:
+                    _log(colored(f"{dep_name} 조회 실패 ({type(ex).__name__}), 복구 시도", "yellow"))
+                    try:
+                        watcher.recover(ex)
+                    except Exception as err:
+                        _log(colored(f"{dep_name} 복구 실패: {err}", "red"))
+                    continue
+                for train in watcher.open_trains:
+                    key = _train_key(train)
+                    need = seats - holdings.seats_on(key)
+                    if need <= 0:
+                        continue
+                    candidates.append((need, dep_name, train, key))
+
+            # 이미 표를 들고 있는 열차를 최우선으로 (짝이 맞는 순간이 목표다),
+            # 그 다음 --prefer-dep, 그 다음 이른 출발 순
+            candidates.sort(
+                key=lambda c: (
+                    0 if holdings.seats_on(c[3]) > 0 else 1,
+                    0 if c[1] == prefer_dep else 1,
+                    c[2].dep_date,
+                    c[2].dep_time,
+                )
+            )
+
+            # 4) 예약 시도
+            for need, dep_name, train, key in candidates:
+                if max_holds and holdings.total() >= max_holds and holdings.seats_on(key) == 0:
+                    continue  # 상한에 걸렸으면 새 열차로 벌리지 않는다 (짝 맞추기는 계속)
+                if dry_run:
+                    _log(colored(f"[DRY-RUN] 예약 시도했을 열차: [{dep_name}] {train} (필요 {need}석)", "cyan"))
+                    continue
+
+                # 한 번에 need 석을 잡을 수 있으면 그게 최선, 안 되면 1석이라도
+                for count in ([need, 1] if need > 1 else [1]):
+                    try:
+                        rsv = watchers[dep_name].rail.reserve(
+                            train, passengers=[AdultPassenger(count)], option=option
+                        )
+                    except KorailError as ex:
+                        msg = getattr(ex, "msg", str(ex))
+                        if count == 1 or "잔여" in msg or "Sold out" in msg:
+                            if not any(k in msg for k in ("Sold out", "잔여석없음")):
+                                _log(colored(f"  예약 거부 ({msg})", "yellow"))
+                            break
+                        continue
+                    except Exception as ex:
+                        _log(colored(f"  예약 오류 ({type(ex).__name__}: {ex})", "red"))
+                        break
+
+                    text = f"🎫 {count}석 확보: [{dep_name}] {train}\n{rsv}"
+                    text += (
+                        "\n" + _settle(watchers[dep_name].rail, rsv)
+                        if pay
+                        else "\n⚠️ 미결제 상태입니다. 구입기한 내 결제하세요."
+                    )
+                    _log(colored(text, "white", "on_green"))
+                    notify(text)
+                    try:
+                        holdings.refresh()
+                    except Exception:
+                        # 다음 회차에 다시 읽는다. 최소한 방금 산 만큼은 반영해 둔다.
+                        holdings.by_train[key] = holdings.seats_on(key) + count
+                    break
+
+            # 5) 현황 한 줄
+            held_desc = ", ".join(
+                f"{k[0]}:{n}석" for k, n in sorted(holdings.by_train.items())
+            ) or "없음"
+            _log(
+                f"#{sweep_no:<4d} {'/'.join(active)}→{arr} | 보유 {holdings.total()}석 ({held_desc})"
+            )
+
+            time.sleep(gammavariate(4, interval / 8) + interval * 0.5)
+
+    except KeyboardInterrupt:
+        _log("종료합니다. 현재 보유:")
+        print(holdings.describe())
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(pair())
