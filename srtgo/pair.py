@@ -33,6 +33,7 @@ from .watch import (
     RailWatcher,
     _log,
     _notify,
+    _now,
     _resolve_stations,
     _telegram_sender,
     parse_when,
@@ -183,6 +184,8 @@ def _dep_of(key: TrainKey, holdings: Holdings) -> Optional[str]:
 @click.option("--seat-type", type=click.Choice(["any", "general", "special"]),
               default="any", show_default=True)
 @click.option("--interval", default=30, show_default=True, help=f"조회 간격 (초, 최소 {MIN_INTERVAL})")
+@click.option("--summary-interval", default=60, show_default=True,
+              help="진행 상황 요약을 보낼 주기 (분, 0=보내지 않음)")
 @click.option("--pay/--no-pay", default=True, show_default=True,
               help="예약 즉시 등록된 카드로 결제 (미결제 예약은 구입기한이 지나면 사라집니다)")
 @click.option("--telegram/--no-telegram", default=True, show_default=True,
@@ -191,7 +194,7 @@ def _dep_of(key: TrainKey, holdings: Holdings) -> Optional[str]:
 @click.option("--yes", "assume_yes", is_flag=True, help="시작 확인 프롬프트 생략")
 @click.option("--debug", is_flag=True, help="디버그 출력")
 def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
-         interval, pay, telegram, dry_run, assume_yes, debug):
+         interval, summary_interval, pay, telegram, dry_run, assume_yes, debug):
     """1석씩 모아서 한 열차에 --seats 장을 맞추는 예매기 (코레일 계정 전용)."""
     interval = max(interval, MIN_INTERVAL)
     start_dt, end_dt = parse_when(start), parse_when(end, end=True)
@@ -248,6 +251,44 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
     floor: Optional[TrainKey] = None  # 이미 인원수를 채운 열차 (놓지 않는다)
     sweep_no = 0
 
+    # 새벽에 돌려두는 용도라, 아무 일이 없어도 살아 있다는 신호를 주기적으로 보낸다
+    began = _now()
+    last_summary = began
+    stats = {
+        "sweeps": 0, "scanned": 0, "open": 0,
+        "attempts": 0, "bought": 0, "spent": 0, "rejects": {}, "errors": 0,
+    }
+
+    def send_summary(reason: str = "정기") -> None:
+        nonlocal last_summary
+        now = _now()
+        elapsed = now - began
+        hours, rem = divmod(int(elapsed.total_seconds()), 3600)
+        minutes = rem // 60
+        rejects = ", ".join(
+            f"{msg} {n}회" for msg, n in sorted(
+                stats["rejects"].items(), key=lambda kv: -kv[1]
+            )[:4]
+        ) or "없음"
+        held = ", ".join(
+            f"{k[0]} {n}석" for k, n in sorted(holdings.by_train.items())
+        ) or "없음"
+        text = (
+            f"📊 srtgo-pair {reason} 요약 ({now:%m/%d %H:%M})\n"
+            f"경과 {hours}시간 {minutes}분 · {stats['sweeps']}회차\n"
+            f"대상 {'/'.join(active)}→{arr} · 마지막 회차 {stats['scanned']}편 중 "
+            f"예매가능 {stats['open']}편\n"
+            f"예약 시도 {stats['attempts']}회 → 확보 {stats['bought']}석"
+            + (f" ({stats['spent']:,}원)" if stats["spent"] else "")
+            + f"\n거부 사유: {rejects}"
+            + (f"\n조회/예약 오류 {stats['errors']}회" if stats["errors"] else "")
+            + f"\n현재 보유: {held}"
+            + (f"\n바닥 확보됨: {floor[0]} (이제 {prefer_dep} 만 탐색)" if floor else "")
+        )
+        _log(colored(text, "cyan"))
+        notify(text)
+        last_summary = now
+
     def notify(text: str) -> None:
         _notify(text, tg, None)
 
@@ -302,23 +343,30 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
 
             # 3) 후보 수집 - 지금 예약 가능한 열차
             candidates = []
+            stats["sweeps"] = sweep_no
+            scanned = opened = 0
             for dep_name in active:
                 watcher = watchers[dep_name]
                 try:
                     watcher.check()  # sweep + 가용 판정, open_trains 를 채운다
                 except Exception as ex:
+                    stats["errors"] += 1
                     _log(colored(f"{dep_name} 조회 실패 ({type(ex).__name__}), 복구 시도", "yellow"))
                     try:
                         watcher.recover(ex)
                     except Exception as err:
                         _log(colored(f"{dep_name} 복구 실패: {err}", "red"))
                     continue
+                scanned += len(watcher.state)
+                opened += len(watcher.open_trains)
                 for train in watcher.open_trains:
                     key = _train_key(train)
                     need = seats - holdings.seats_on(key)
                     if need <= 0:
                         continue
                     candidates.append((need, dep_name, train, key))
+
+            stats["scanned"], stats["open"] = scanned, opened
 
             # 이미 표를 들고 있는 열차를 최우선으로 (짝이 맞는 순간이 목표다),
             # 그 다음 --prefer-dep, 그 다음 이른 출발 순
@@ -347,21 +395,26 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
                 bought = 0
                 # 한 번에 need 석을 잡을 수 있으면 그게 최선, 안 되면 1석이라도
                 for count in ([need, 1] if need > 1 else [1]):
+                    stats["attempts"] += 1
                     try:
                         rsv = watchers[dep_name].rail.reserve(
                             train, passengers=[AdultPassenger(count)], option=option
                         )
                     except KorailError as ex:
                         msg = getattr(ex, "msg", str(ex))
+                        stats["rejects"][msg] = stats["rejects"].get(msg, 0) + 1
                         if count == 1 or "잔여" in msg or "Sold out" in msg:
                             if not any(k in msg for k in ("Sold out", "잔여석없음")):
                                 _log(colored(f"  예약 거부 ({msg})", "yellow"))
                             break
                         continue
                     except Exception as ex:
+                        stats["errors"] += 1
                         _log(colored(f"  예약 오류 ({type(ex).__name__}: {ex})", "red"))
                         break
 
+                    stats["bought"] += count
+                    stats["spent"] += int(getattr(rsv, "price", 0) or 0)
                     text = f"🎫 {count}석 확보: [{dep_name}] {train}\n{rsv}"
                     text += (
                         "\n" + _settle(watchers[dep_name].rail, rsv)
@@ -401,11 +454,19 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
                 f"#{sweep_no:<4d} {'/'.join(active)}→{arr} | 보유 {holdings.total()}석 ({held_desc})"
             )
 
+            # 6) 주기 요약 - 아무 일이 없어도 살아 있다는 신호를 보낸다
+            if summary_interval and (
+                (_now() - last_summary).total_seconds() >= summary_interval * 60
+            ):
+                send_summary()
+
             time.sleep(gammavariate(4, interval / 8) + interval * 0.5)
 
     except KeyboardInterrupt:
         _log("종료합니다. 현재 보유:")
         print(holdings.describe())
+        if summary_interval:
+            send_summary("중단")
         return 0
 
 
