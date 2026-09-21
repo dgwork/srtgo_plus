@@ -938,7 +938,6 @@ class SRT:
         Raises:
             SRTNotLoggedInError: If not logged in
             TypeError: If train is not SRTTrain
-            ValueError: If train is not SRT
             SRTError: If reservation not found after creation
         """
         if not self.is_login:
@@ -946,9 +945,6 @@ class SRT:
 
         if not isinstance(train, SRTTrain):
             raise TypeError('"train" must be SRTTrain instance')
-
-        if train.train_name != "SRT":
-            raise ValueError(f'Expected "SRT" train, got {train.train_name}')
 
         passengers = Passenger.combine(passengers or [Adult()])
 
