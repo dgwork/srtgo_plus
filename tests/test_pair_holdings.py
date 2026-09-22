@@ -11,7 +11,7 @@
 
 from datetime import datetime
 
-from srtgo.pair import Holdings, _standby_want
+from srtgo.pair import Holdings, _standby_want, _delta_line, _stats_snapshot
 
 START = datetime(2026, 10, 20, 17, 0)
 END = datetime(2026, 10, 21, 10, 0)
@@ -164,6 +164,46 @@ def test_standby_want_respects_max_standby():
     assert _standby_want(need=2, held_standby=0, standby_total=0, max_standby=2) == 2
     # 0 = 무제한
     assert _standby_want(need=2, held_standby=0, standby_total=99, max_standby=0) == 2
+
+
+def _stats(attempts=0, bought=0, standby=0, errors=0, rejects=None, sweeps=0):
+    return {
+        "sweeps": sweeps, "scanned": 0, "open": 0, "attempts": attempts,
+        "bought": bought, "standby": standby, "spent": 0,
+        "rejects": dict(rejects or {}), "errors": errors,
+    }
+
+
+def test_delta_line_marks_quiet_period():
+    """누적치만 보내면 조용한 건지 멈춘 건지 구분이 안 된다."""
+    prev = _stats(attempts=1, rejects={"Sold out": 1})
+    now = _stats(attempts=1, rejects={"Sold out": 1}, sweeps=60)
+    assert "변화 없음" in _delta_line(now, prev)
+
+
+def test_delta_line_reports_only_new_events():
+    """지난 요약 이후 새로 생긴 것만 센다. 누적치를 그대로 쓰면 안 된다."""
+    prev = _stats(attempts=1, bought=0, rejects={"Sold out": 1})
+    now = _stats(attempts=3, bought=1, rejects={"Sold out": 2, "잔여석없음": 1})
+    line = _delta_line(now, prev)
+    assert "시도 +2" in line and "확보 +1석" in line
+    assert "거부 +2" in line          # Sold out +1, 잔여석없음 +1
+    assert "변화 없음" not in line
+
+
+def test_delta_line_counts_new_standby():
+    prev = _stats(standby=0)
+    now = _stats(standby=2)
+    assert "대기 +2석" in _delta_line(now, prev)
+
+
+def test_snapshot_does_not_alias_rejects():
+    """rejects 를 얕게 복사하면 다음 주기 증분이 항상 0 으로 나온다."""
+    stats = _stats(rejects={"Sold out": 1})
+    snap = _stats_snapshot(stats)
+    stats["rejects"]["Sold out"] = 5
+    assert snap["rejects"]["Sold out"] == 1
+    assert "거부 +4" in _delta_line(stats, snap)
 
 
 def test_describe_marks_standby():

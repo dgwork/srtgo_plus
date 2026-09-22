@@ -61,6 +61,37 @@ def _rsv_key(rsv) -> TrainKey:
     return (str(rsv.train_no), str(rsv.dep_date))
 
 
+def _stats_snapshot(stats: dict) -> dict:
+    """요약을 보낸 시점의 집계를 떠둔다. rejects 는 얕은 복사로는 부족하다."""
+    snap = {k: v for k, v in stats.items() if k != "rejects"}
+    snap["rejects"] = dict(stats["rejects"])
+    return snap
+
+
+def _delta_line(stats: dict, prev: dict) -> str:
+    """지난 요약 이후 '새로 생긴 것' 만 한 줄로 뽑는다.
+
+    누적치만 보내면 아무 일이 없는 동안 숫자가 그대로라, 조용한 것인지
+    멈춘 것인지 구분이 되지 않는다.
+    """
+    d_att = stats["attempts"] - prev["attempts"]
+    d_bought = stats["bought"] - prev["bought"]
+    d_standby = stats["standby"] - prev["standby"]
+    d_err = stats["errors"] - prev["errors"]
+    d_rej = sum(n - prev["rejects"].get(m, 0) for m, n in stats["rejects"].items())
+
+    line = f"이번 주기: 시도 +{d_att}, 확보 +{d_bought}석"
+    if d_standby:
+        line += f", 대기 +{d_standby}석"
+    if d_rej:
+        line += f", 거부 +{d_rej}"
+    if d_err:
+        line += f", 오류 +{d_err}"
+    if not (d_att or d_bought or d_standby or d_err or d_rej):
+        line += "  ← 변화 없음"
+    return line
+
+
 def _standby_want(need: int, held_standby: int, standby_total: int, max_standby: int) -> int:
     """이 열차에 예약대기를 몇 석 더 신청할지. 0 이면 신청하지 않는다.
 
@@ -315,8 +346,10 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
         "attempts": 0, "bought": 0, "standby": 0, "spent": 0, "rejects": {}, "errors": 0,
     }
 
+    last_stats = _stats_snapshot(stats)
+
     def send_summary(reason: str = "정기") -> None:
-        nonlocal last_summary
+        nonlocal last_summary, last_stats
         now = _now()
         elapsed = now - began
         hours, rem = divmod(int(elapsed.total_seconds()), 3600)
@@ -332,13 +365,15 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
         ) or "없음"
         text = (
             f"📊 srtgo-pair {reason} 요약 ({now:%m/%d %H:%M})\n"
-            f"경과 {hours}시간 {minutes}분 · {stats['sweeps']}회차\n"
+            f"경과 {hours}시간 {minutes}분 · {stats['sweeps']}회차"
+            f" (+{stats['sweeps'] - last_stats['sweeps']})\n"
             f"대상 {'/'.join(active)}→{arr} · 마지막 회차 {stats['scanned']}편 중 "
             f"예매가능 {stats['open']}편\n"
-            f"예약 시도 {stats['attempts']}회 → 확보 {stats['bought']}석"
+            f"{_delta_line(stats, last_stats)}\n"
+            f"누적: 시도 {stats['attempts']}회 → 확보 {stats['bought']}석"
             + (f" ({stats['spent']:,}원)" if stats["spent"] else "")
             + (f" · 예약대기 {stats['standby']}석" if stats["standby"] else "")
-            + f"\n거부 사유: {rejects}"
+            + f"\n거부 사유(누적): {rejects}"
             + (f"\n조회/예약 오류 {stats['errors']}회" if stats["errors"] else "")
             + f"\n현재 보유: {held}"
             + (f"\n바닥 확보됨: {floor[0]} (이제 {prefer_dep} 만 탐색)" if floor else "")
@@ -346,6 +381,7 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
         _log(colored(text, "cyan"))
         notify(text)
         last_summary = now
+        last_stats = _stats_snapshot(stats)
 
     def notify(text: str) -> None:
         _notify(text, tg, None)
