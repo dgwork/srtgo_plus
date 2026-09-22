@@ -46,6 +46,10 @@ SEAT_OPTION = {
     "special": ReserveOption.SPECIAL_ONLY,
 }
 
+# 이 문구로 거부당하면 그 열차엔 더 이상 대기를 걸 수 없다는 뜻이다.
+# 매 스윕 재시도해봐야 거부만 쌓이므로 해당 열차의 대기 신청을 접는다.
+STANDBY_LIMIT_MARKERS = ("한도수초과", "예약대기 접수가 마감")
+
 TrainKey = Tuple[str, str]
 
 
@@ -55,6 +59,24 @@ def _train_key(train) -> TrainKey:
 
 def _rsv_key(rsv) -> TrainKey:
     return (str(rsv.train_no), str(rsv.dep_date))
+
+
+def _standby_want(need: int, held_standby: int, standby_total: int, max_standby: int) -> int:
+    """이 열차에 예약대기를 몇 석 더 신청할지. 0 이면 신청하지 않는다.
+
+    목표는 언제나 '한 열차에 seats 석' 이다. 1석짜리 대기 하나만 걸어두면
+    짝이 안 맞아 쓸모가 없으므로, 이미 가진 좌석(need 에 반영됨)과 걸어둔
+    대기를 합쳐 모자란 만큼 계속 채운다.
+    """
+    want = need - held_standby
+    if want <= 0:
+        return 0  # 좌석 + 대기로 이미 인원수를 덮었다
+    if max_standby:
+        room = max_standby - standby_total
+        if room <= 0:
+            return 0
+        want = min(want, room)
+    return want
 
 
 def _dep_dt(date: str, dep_time: str) -> datetime:
@@ -282,6 +304,7 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
     option = SEAT_OPTION[seat_type]
     active = list(deps)          # 지금 노리는 출발역들
     floor: Optional[TrainKey] = None  # 이미 인원수를 채운 열차 (놓지 않는다)
+    standby_blocked: set = set()  # 대기 한도가 차서 더 못 거는 열차
     sweep_no = 0
 
     # 새벽에 돌려두는 용도라, 아무 일이 없어도 살아 있다는 신호를 주기적으로 보낸다
@@ -407,7 +430,9 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
             # 그 다음 --prefer-dep, 그 다음 이른 출발 순
             candidates.sort(
                 key=lambda c: (
-                    0 if holdings.seats_on(c[3]) > 0 else 1,
+                    # 좌석이든 대기든 이미 걸쳐 있는 열차를 먼저 채운다. 그러지
+                    # 않으면 대기 1석씩이 여러 열차에 흩어져 짝이 영영 안 맞는다.
+                    0 if (holdings.seats_on(c[3]) or holdings.standby_on(c[3])) else 1,
                     0 if c[1] == prefer_dep else 1,
                     c[2].dep_date,
                     c[2].dep_time,
@@ -423,25 +448,33 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
                 # 상한도 집계도 좌석과 다르게 다뤄야 한다.
                 standby_only = not train.has_seat()
                 if standby_only:
-                    if holdings.standby_on(key):
-                        continue  # 이미 대기를 걸어둔 열차 (중복 신청 방지)
-                    if max_standby and holdings.standby_total() >= max_standby:
+                    # 목표는 언제나 '한 열차에 seats 석' 이다. 1석짜리 대기 하나로
+                    # 끝내면 짝이 안 맞아 쓸모가 없으므로, 이미 가진 좌석과 걸어둔
+                    # 대기를 합쳐 모자란 만큼 계속 채운다.
+                    if key in standby_blocked:
+                        continue
+                    want = _standby_want(
+                        need, holdings.standby_on(key), holdings.standby_total(), max_standby
+                    )
+                    if want <= 0:
                         continue
                 else:
+                    want = need
                     in_play = holdings.total() - floor_seats
                     if max_holds and in_play >= max_holds and holdings.seats_on(key) == 0:
                         continue  # 상한에 걸렸으면 새 열차로 벌리지 않는다 (짝 맞추기는 계속)
                 if dry_run:
                     kind = "예약대기 신청" if standby_only else "예약 시도"
-                    _log(colored(f"[DRY-RUN] {kind}했을 열차: [{dep_name}] {train} (필요 {need}석)", "cyan"))
+                    _log(colored(f"[DRY-RUN] {kind}했을 열차: [{dep_name}] {train} (필요 {want}석)", "cyan"))
                     continue
 
                 prev = holdings.seats_on(key)
+                prev_standby = holdings.standby_on(key)
                 bought = 0
                 standby_got = 0
-                # 한 번에 need 석을 잡을 수 있으면 그게 최선, 안 되면 1석이라도.
-                # 예약대기는 쪼개도 일행이 못 모이므로 필요한 만큼 한 번만 신청한다.
-                for count in ([need] if standby_only else ([need, 1] if need > 1 else [1])):
+                # 한 번에 want 석을 잡을 수 있으면 그게 최선, 안 되면 1석이라도.
+                # 좌석이든 대기든 같다 - 1석씩 모아 짝을 맞추는 게 이 도구의 전략이다.
+                for count in ([want, 1] if want > 1 else [1]):
                     stats["attempts"] += 1
                     try:
                         rsv = watchers[dep_name].rail.reserve(
@@ -450,6 +483,11 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
                     except KorailError as ex:
                         msg = getattr(ex, "msg", str(ex))
                         stats["rejects"][msg] = stats["rejects"].get(msg, 0) + 1
+                        if standby_only and any(m in msg for m in STANDBY_LIMIT_MARKERS):
+                            # 대기 한도가 찬 열차다. 재시도해도 거부만 쌓인다.
+                            standby_blocked.add(key)
+                            _log(colored(f"  대기 한도 도달, 이 열차는 접습니다 ({msg})", "yellow"))
+                            break
                         if count == 1 or "잔여" in msg or "Sold out" in msg:
                             if not any(k in msg for k in ("Sold out", "잔여석없음")):
                                 _log(colored(f"  예약 거부 ({msg})", "yellow"))
@@ -494,8 +532,10 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
                     except Exception:
                         pass
                     holdings.dep_hint[key] = dep_name
-                    if holdings.standby_on(key) < standby_got:
-                        holdings.standby[key] = standby_got
+                    # 서버 목록 반영이 늦어도 방금 건 대기는 반드시 반영한다.
+                    # 빠지면 다음 스윕에 같은 열차로 또 신청한다.
+                    if holdings.standby_on(key) < prev_standby + standby_got:
+                        holdings.standby[key] = prev_standby + standby_got
                     continue
 
                 if not bought:

@@ -11,7 +11,7 @@
 
 from datetime import datetime
 
-from srtgo.pair import Holdings
+from srtgo.pair import Holdings, _standby_want
 
 START = datetime(2026, 10, 20, 17, 0)
 END = datetime(2026, 10, 21, 10, 0)
@@ -139,6 +139,31 @@ def test_standby_outside_window_is_ignored():
     w.dep_date = "20261101"
     h = _holdings(reservations=[w])
     assert h.standby == {}
+
+
+def test_standby_want_keeps_filling_until_party_size():
+    """1석짜리 대기 하나로 끝내면 짝이 안 맞아 쓸모가 없다. 인원수까지 채워야 한다."""
+    # 좌석 0, 대기 0 -> 2석 모두 필요
+    assert _standby_want(need=2, held_standby=0, standby_total=0, max_standby=0) == 2
+    # 대기 1석을 이미 걸어둠 -> 1석 더
+    assert _standby_want(need=2, held_standby=1, standby_total=1, max_standby=0) == 1
+    # 대기로 인원수를 다 덮음 -> 그만
+    assert _standby_want(need=2, held_standby=2, standby_total=2, max_standby=0) == 0
+
+
+def test_standby_want_counts_confirmed_seats():
+    """확정 1석을 들고 있으면(need=1) 대기는 1석만 더 걸면 된다."""
+    assert _standby_want(need=1, held_standby=0, standby_total=1, max_standby=0) == 1
+    assert _standby_want(need=1, held_standby=1, standby_total=2, max_standby=0) == 0
+
+
+def test_standby_want_respects_max_standby():
+    """상한이 남은 만큼만 신청한다. 상한이 차면 아예 걸지 않는다."""
+    assert _standby_want(need=2, held_standby=0, standby_total=1, max_standby=2) == 1
+    assert _standby_want(need=2, held_standby=0, standby_total=2, max_standby=2) == 0
+    assert _standby_want(need=2, held_standby=0, standby_total=0, max_standby=2) == 2
+    # 0 = 무제한
+    assert _standby_want(need=2, held_standby=0, standby_total=99, max_standby=0) == 2
 
 
 def test_describe_marks_standby():
