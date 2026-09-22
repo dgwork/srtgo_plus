@@ -97,6 +97,56 @@ def test_total_failure_raises_instead_of_reporting_zero():
     raise AssertionError("조회 전면 실패는 예외로 올려야 한다")
 
 
+class _Waiting(_Row):
+    """reservations() 가 돌려주는 예약대기 한 건."""
+
+    def __init__(self, train_no, pnr, dep="수서", seat_cnt=1):
+        super().__init__(train_no, pnr, dep=dep, seat_cnt=seat_cnt)
+        self.rsv_id = pnr
+        self.is_waiting = True
+
+    def __repr__(self):
+        return f"[KTX {self.train_no}] {self.dep_name}~{self.arr_name} 예약대기"
+
+
+def test_standby_is_not_counted_as_seat():
+    """예약대기를 좌석으로 세면 자리도 없이 '인원수 확보' 로 오판하고 종료한다."""
+    h = _holdings(reservations=[_Waiting("397", "W1"), _Waiting("397", "W2")])
+    assert h.seats_on(("397", "20261020")) == 0
+    assert h.total() == 0
+    assert h.complete_trains(2) == []
+
+
+def test_standby_is_tracked_for_dedup():
+    """버리지 않고 따로 세야 같은 열차에 매 스윕 중복 신청하는 것을 막는다."""
+    h = _holdings(reservations=[_Waiting("397", "W1", seat_cnt=2)])
+    assert h.standby_on(("397", "20261020")) == 2
+    assert h.standby_total() == 2
+
+
+def test_seat_and_standby_coexist_on_same_train():
+    """같은 열차에 확정 1석 + 대기 1석이면, 짝은 아직 안 맞은 것이다."""
+    h = _holdings(tickets=[_Row("397", "PNR1")], reservations=[_Waiting("397", "W1")])
+    key = ("397", "20261020")
+    assert h.seats_on(key) == 1
+    assert h.standby_on(key) == 1
+    assert h.complete_trains(2) == []
+
+
+def test_standby_outside_window_is_ignored():
+    """시간대 밖의 대기는 집계에 들어오면 안 된다 (좌석과 같은 기준)."""
+    w = _Waiting("999", "W9")
+    w.dep_date = "20261101"
+    h = _holdings(reservations=[w])
+    assert h.standby == {}
+
+
+def test_describe_marks_standby():
+    h = _holdings(tickets=[_Row("397", "PNR1")], reservations=[_Waiting("395", "W1")])
+    out = h.describe()
+    assert out.count("[대기]") == 1, out
+
+
 if __name__ == "__main__":
     passed = 0
     for name, fn in sorted(globals().items()):

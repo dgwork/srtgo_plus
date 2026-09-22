@@ -79,6 +79,10 @@ class Holdings:
         self.end = end
         self.by_train: Dict[TrainKey, int] = {}
         self.detail: Dict[TrainKey, List] = {}
+        # 예약대기는 확정 좌석이 아니므로 좌석 집계와 분리해서 센다.
+        # 버리지 않고 세어 두어야 같은 열차에 중복 신청하는 것을 막을 수 있다.
+        self.standby: Dict[TrainKey, int] = {}
+        self.standby_detail: Dict[TrainKey, List] = {}
         # 서버 목록 반영이 늦을 때 쓰는 출발역 보조 정보
         self.dep_hint: Dict[TrainKey, str] = {}
 
@@ -115,11 +119,10 @@ class Holdings:
 
     def refresh(self) -> None:
         by_train, detail = {}, {}
+        standby, standby_detail = {}, {}
         for rsv in self._all_holdings():
             if rsv.arr_name != self.arr or rsv.dep_name not in self.deps:
                 continue
-            if getattr(rsv, "is_waiting", False):
-                continue  # 예약대기는 확정 좌석이 아니다
             try:
                 when = _dep_dt(rsv.dep_date, rsv.dep_time)
             except (TypeError, ValueError):
@@ -127,10 +130,21 @@ class Holdings:
             if not (self.start <= when <= self.end):
                 continue
             key = _rsv_key(rsv)
-            by_train[key] = by_train.get(key, 0) + int(rsv.seat_no_count)
+            try:
+                count = int(rsv.seat_no_count)
+            except (TypeError, ValueError):
+                count = 1
+            if getattr(rsv, "is_waiting", False):
+                # 예약대기는 좌석으로 세지 않는다. 좌석으로 셌다가는 자리도
+                # 없는데 '인원수 확보' 로 오판하고 종료해 버린다.
+                standby[key] = standby.get(key, 0) + count
+                standby_detail.setdefault(key, []).append(rsv)
+                continue
+            by_train[key] = by_train.get(key, 0) + count
             detail.setdefault(key, []).append(rsv)
         # 조회가 통째로 실패한 경우가 아니라면 갱신한다
         self.by_train, self.detail = by_train, detail
+        self.standby, self.standby_detail = standby, standby_detail
 
     def seats_on(self, key: TrainKey) -> int:
         return self.by_train.get(key, 0)
@@ -138,16 +152,25 @@ class Holdings:
     def total(self) -> int:
         return sum(self.by_train.values())
 
+    def standby_on(self, key: TrainKey) -> int:
+        return self.standby.get(key, 0)
+
+    def standby_total(self) -> int:
+        return sum(self.standby.values())
+
     def complete_trains(self, seats: int) -> List[TrainKey]:
         return [k for k, n in self.by_train.items() if n >= seats]
 
     def describe(self) -> str:
-        if not self.detail:
-            return "  (보유 없음)"
         lines = []
         for key in sorted(self.detail, key=lambda k: (k[1], k[0])):
             for rsv in self.detail[key]:
                 lines.append(f"  {rsv}")
+        for key in sorted(self.standby_detail, key=lambda k: (k[1], k[0])):
+            for rsv in self.standby_detail[key]:
+                lines.append(f"  [대기] {rsv}")
+        if not lines:
+            return "  (보유 없음)"
         return "\n".join(lines)
 
 
@@ -181,6 +204,10 @@ def _dep_of(key: TrainKey, holdings: Holdings) -> Optional[str]:
 @click.option("--seats", default=2, show_default=True, help="일행 인원수 (한 열차에 모아야 할 좌석 수)")
 @click.option("--max-holds", default=4, show_default=True,
               help="동시에 들고 있을 1인 예약 총 수의 상한 (0=무제한)")
+@click.option("--include-standby", is_flag=True,
+              help="좌석이 없어도 예약대기가 열려 있으면 대기를 걸어둡니다 (결제는 하지 않음).")
+@click.option("--max-standby", default=2, show_default=True,
+              help="동시에 걸어둘 예약대기 좌석 수의 상한 (0=무제한). --include-standby 와 함께 씁니다.")
 @click.option("--seat-type", type=click.Choice(["any", "general", "special"]),
               default="any", show_default=True)
 @click.option("--interval", default=30, show_default=True, help=f"조회 간격 (초, 최소 {MIN_INTERVAL})")
@@ -193,7 +220,8 @@ def _dep_of(key: TrainKey, holdings: Holdings) -> Optional[str]:
 @click.option("--dry-run", is_flag=True, help="예약은 하지 않고 무엇을 시도할지만 출력")
 @click.option("--yes", "assume_yes", is_flag=True, help="시작 확인 프롬프트 생략")
 @click.option("--debug", is_flag=True, help="디버그 출력")
-def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
+def pair(deps, arr, prefer_dep, start, end, seats, max_holds,
+         include_standby, max_standby, seat_type,
          interval, summary_interval, pay, telegram, dry_run, assume_yes, debug):
     """1석씩 모아서 한 열차에 --seats 장을 맞추는 예매기 (코레일 계정 전용)."""
     interval = max(interval, MIN_INTERVAL)
@@ -217,6 +245,11 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
         + (f" (최종 목표 출발역: {prefer_dep})" if prefer_dep else "")
         + f"\n  보유상한: {max_holds or '무제한'}\n"
         + (
+            f"  예약대기: 좌석이 없으면 대기 신청 (상한 {max_standby or '무제한'}석, 결제하지 않음)\n"
+            if include_standby
+            else "  예약대기: 걸지 않음\n"
+        )
+        + (
             "  결제   : 예약 즉시 등록된 카드로 자동 결제\n"
             "           (짝이 맞지 않은 표도 결제되며, 취소 시 환불 수수료가 붙습니다)\n"
             if pay
@@ -238,7 +271,7 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
     sessions: Dict[str, object] = {}
     watchers = {
         d: RailWatcher("KTX", d, arr, start_dt, end_dt, {"adult": 1, "child": 0, "senior": 0},
-                       seat_type, False, False, debug, sessions)
+                       seat_type, include_standby, False, debug, sessions)
         for d in deps
     }
     for w in watchers.values():
@@ -256,7 +289,7 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
     last_summary = began
     stats = {
         "sweeps": 0, "scanned": 0, "open": 0,
-        "attempts": 0, "bought": 0, "spent": 0, "rejects": {}, "errors": 0,
+        "attempts": 0, "bought": 0, "standby": 0, "spent": 0, "rejects": {}, "errors": 0,
     }
 
     def send_summary(reason: str = "정기") -> None:
@@ -271,7 +304,8 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
             )[:4]
         ) or "없음"
         held = ", ".join(
-            f"{k[0]} {n}석" for k, n in sorted(holdings.by_train.items())
+            [f"{k[0]} {n}석" for k, n in sorted(holdings.by_train.items())]
+            + [f"{k[0]} 대기{n}석" for k, n in sorted(holdings.standby.items())]
         ) or "없음"
         text = (
             f"📊 srtgo-pair {reason} 요약 ({now:%m/%d %H:%M})\n"
@@ -280,6 +314,7 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
             f"예매가능 {stats['open']}편\n"
             f"예약 시도 {stats['attempts']}회 → 확보 {stats['bought']}석"
             + (f" ({stats['spent']:,}원)" if stats["spent"] else "")
+            + (f" · 예약대기 {stats['standby']}석" if stats["standby"] else "")
             + f"\n거부 사유: {rejects}"
             + (f"\n조회/예약 오류 {stats['errors']}회" if stats["errors"] else "")
             + f"\n현재 보유: {held}"
@@ -384,17 +419,29 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
             # 인원수를 채운 순간 상한이 차버려서 2단계에서 수서 표를 못 산다.
             floor_seats = holdings.seats_on(floor) if floor else 0
             for need, dep_name, train, key in candidates:
-                in_play = holdings.total() - floor_seats
-                if max_holds and in_play >= max_holds and holdings.seats_on(key) == 0:
-                    continue  # 상한에 걸렸으면 새 열차로 벌리지 않는다 (짝 맞추기는 계속)
+                # 좌석이 없고 예약대기만 열린 열차인지 구분한다.
+                # 상한도 집계도 좌석과 다르게 다뤄야 한다.
+                standby_only = not train.has_seat()
+                if standby_only:
+                    if holdings.standby_on(key):
+                        continue  # 이미 대기를 걸어둔 열차 (중복 신청 방지)
+                    if max_standby and holdings.standby_total() >= max_standby:
+                        continue
+                else:
+                    in_play = holdings.total() - floor_seats
+                    if max_holds and in_play >= max_holds and holdings.seats_on(key) == 0:
+                        continue  # 상한에 걸렸으면 새 열차로 벌리지 않는다 (짝 맞추기는 계속)
                 if dry_run:
-                    _log(colored(f"[DRY-RUN] 예약 시도했을 열차: [{dep_name}] {train} (필요 {need}석)", "cyan"))
+                    kind = "예약대기 신청" if standby_only else "예약 시도"
+                    _log(colored(f"[DRY-RUN] {kind}했을 열차: [{dep_name}] {train} (필요 {need}석)", "cyan"))
                     continue
 
                 prev = holdings.seats_on(key)
                 bought = 0
-                # 한 번에 need 석을 잡을 수 있으면 그게 최선, 안 되면 1석이라도
-                for count in ([need, 1] if need > 1 else [1]):
+                standby_got = 0
+                # 한 번에 need 석을 잡을 수 있으면 그게 최선, 안 되면 1석이라도.
+                # 예약대기는 쪼개도 일행이 못 모이므로 필요한 만큼 한 번만 신청한다.
+                for count in ([need] if standby_only else ([need, 1] if need > 1 else [1])):
                     stats["attempts"] += 1
                     try:
                         rsv = watchers[dep_name].rail.reserve(
@@ -413,6 +460,19 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
                         _log(colored(f"  예약 오류 ({type(ex).__name__}: {ex})", "red"))
                         break
 
+                    # 좌석이 있는 줄 알고 요청했어도 서버가 대기로 잡아주는 경우가
+                    # 있다. 좌석/대기 판정은 응답을 기준으로 한다.
+                    if getattr(rsv, "is_waiting", False):
+                        stats["standby"] += count
+                        text = (
+                            f"🕒 예약대기 신청: [{dep_name}] {train}\n{rsv}\n"
+                            "좌석이 배정되면 구입기한 내에 직접 결제해야 합니다."
+                        )
+                        _log(colored(text, "white", "on_blue"))
+                        notify(text)
+                        standby_got = count
+                        break
+
                     stats["bought"] += count
                     stats["spent"] += int(getattr(rsv, "price", 0) or 0)
                     text = f"🎫 {count}석 확보: [{dep_name}] {train}\n{rsv}"
@@ -425,6 +485,18 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
                     notify(text)
                     bought = count
                     break
+
+                if standby_got:
+                    # 예약대기는 좌석 집계에 절대 넣지 않는다. 넣는 순간 자리도
+                    # 없이 '인원수 확보' 로 오판하고 종료해 버린다.
+                    try:
+                        holdings.refresh()
+                    except Exception:
+                        pass
+                    holdings.dep_hint[key] = dep_name
+                    if holdings.standby_on(key) < standby_got:
+                        holdings.standby[key] = standby_got
+                    continue
 
                 if not bought:
                     continue
@@ -448,10 +520,13 @@ def pair(deps, arr, prefer_dep, start, end, seats, max_holds, seat_type,
 
             # 5) 현황 한 줄
             held_desc = ", ".join(
-                f"{k[0]}:{n}석" for k, n in sorted(holdings.by_train.items())
+                [f"{k[0]}:{n}석" for k, n in sorted(holdings.by_train.items())]
+                + [f"{k[0]}:대기{n}석" for k, n in sorted(holdings.standby.items())]
             ) or "없음"
             _log(
-                f"#{sweep_no:<4d} {'/'.join(active)}→{arr} | 보유 {holdings.total()}석 ({held_desc})"
+                f"#{sweep_no:<4d} {'/'.join(active)}→{arr} | 보유 {holdings.total()}석"
+                + (f" + 대기 {holdings.standby_total()}석" if holdings.standby_total() else "")
+                + f" ({held_desc})"
             )
 
             # 6) 주기 요약 - 아무 일이 없어도 살아 있다는 신호를 보낸다
